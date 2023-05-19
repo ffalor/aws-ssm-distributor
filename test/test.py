@@ -1,11 +1,11 @@
 """Module test"""
 
 import http.client
+from lib2to3.pgen2.token import DOT
 import urllib.parse
 import time
 from datetime import datetime, timedelta
 import json
-from weakref import ref
 from dateutil import tz
 import boto3
 
@@ -301,58 +301,6 @@ def get_parameters_by_path(client, path):
     return response
 
 
-def get_ssm_param_value(client, param_name):
-    """Returns the value of the SSM parameter
-
-    Args:
-        client (boto3.client): Boto3 client for SSM
-        param_name (str): Name of the SSM parameter
-
-    Returns:
-        str: Value of the SSM parameter
-
-    Raises:
-        ValueError: If the SSM parameter is not found
-    """
-    print(f"Retrieving SSM parameter {param_name}")
-    try:
-        response = client.get_parameter(Name=param_name, WithDecryption=True)
-        return response["Parameter"]["Value"]
-    except client.exceptions.ParameterNotFound as exc:
-        raise ValueError(f"SSM parameter {param_name} not found") from exc
-
-
-def put_ssm_param_value(
-    client,
-    name,
-    value,
-    description="SSM Parameter for CrowdStrike Distributor",
-    param_type="String",
-    overwrite=True,
-):
-    """Puts the value of the SSM parameter
-
-    Args:
-        client (boto3.client): Boto3 client for SSM
-        name (str): Name of the SSM parameter
-        value (str): Value of the SSM parameter
-        description (str, optional): Description of the SSM parameter. Defaults to "SSM Parameter for CrowdStrike Distributor".
-        param_type (str, optional): Type of the SSM parameter. Defaults to 'String'.
-        overwrite (bool, optional): Whether to overwrite the SSM parameter if it already exists. Defaults to True.
-
-    Returns:
-        dict: Response from the SSM API
-    """
-    print(f"Putting SSM parameter {name}")
-    return client.put_parameter(
-        Name=name,
-        Value=value,
-        Type=param_type,
-        Description=description,
-        Overwrite=overwrite,
-    )
-
-
 def validate_prefix_path(path):
     """Validates the prefix path for SSM parameters
 
@@ -376,7 +324,7 @@ def validate_prefix_path(path):
     return path
 
 
-def need_refresh(modified_time, delta_minutes=20):
+def is_datetime_old(modified_time, delta_minutes=20):
     """Checks if the datetime is older than delta_minutes
 
     Args:
@@ -387,7 +335,9 @@ def need_refresh(modified_time, delta_minutes=20):
         bool: True if the datetime is older than 20 minutes, False otherwise
     """
 
-    return modified_time < datetime.now(tz=tz.tzlocal()) - timedelta(minutes=delta_minutes)
+    return modified_time < datetime.now(tz=tz.tzlocal()) - timedelta(
+        minutes=delta_minutes
+    )
 
 
 def check_expired_presigned_url(platforms, params_in_path, ssm_param_path_prefix):
@@ -398,23 +348,26 @@ def check_expired_presigned_url(platforms, params_in_path, ssm_param_path_prefix
         params_in_path (dict): A dict of ssm parameters that exist withing the ssm_param_path_prefix path
         ssm_param_path_prefix (str): The path prefix for the ssm parameters
     """
-    refresh_presigned_urls = False
+    needs_refresh = False
 
     for filter_name, _ in platforms.items():
         ssm_path = f"{ssm_param_path_prefix}/{filter_name}"
 
         if not params_in_path.get(ssm_path):
             print(f"SSM parameter {ssm_path} not found")
-            refresh_presigned_urls = True
+            needs_refresh = True
             break
 
-        if need_refresh(params_in_path[ssm_path]["LastModifiedDate"]):
+        if is_datetime_old(params_in_path[ssm_path]["LastModifiedDate"]):
             print(f"SSM parameter {ssm_path} expired")
-            refresh_presigned_urls = True
+            needs_refresh = True
             break
 
-    return refresh_presigned_urls
+    return needs_refresh
 
+
+def refresh_presigned_urls(platforms_filter):
+    pass
 
 def script_handler(events, _):
     """Handler for executeScript action
@@ -430,14 +383,10 @@ def script_handler(events, _):
     falcon_cloud_param_name = events["falcon_cloud"]
     falcon_client_id_param_name = events["falcon_client_id"]
     falcon_client_secret_param_name = events["falcon_client_secret"]
-    ssm_param_path_prefix = validate_prefix_path(
-        events["ssm_param_path_prefix"])
+    ssm_param_path_prefix = validate_prefix_path(events["ssm_param_path_prefix"])
     region = events["region"]
 
     ssm_client = boto3.client("ssm", region_name=region)
-
-    install_token_param_name = f"{ssm_param_path_prefix}/InstallToken"
-    ccid_param_name = f"{ssm_param_path_prefix}/CCID"
 
     # Initialize variables
     falcon_cloud = None
@@ -445,6 +394,8 @@ def script_handler(events, _):
     falcon_client_secret = None
     falcon_ccid = None
     falcon_install_token = None
+    install_token_param_name = f"{ssm_param_path_prefix}/InstallToken"
+    ccid_param_name = f"{ssm_param_path_prefix}/CCID"
 
     # Get all values matching Prefix path
     params_in_path = get_parameters_by_path(ssm_client, ssm_param_path_prefix)
@@ -457,34 +408,54 @@ def script_handler(events, _):
         print(f"Using install token from {install_token_param_name}")
         falcon_install_token = params_in_path[install_token_param_name]["Value"]
 
-    refresh_presigned_urls = check_expired_presigned_url(
+    need_refresh = check_expired_presigned_url(
         platform_filters, params_in_path, ssm_param_path_prefix
     )
 
-    while refresh_presigned_urls:
-        # try to create lock
-        # if we can't creata lock, then sleep for 30 seconds and check if we need to refresh again
-        # then interate over filters and refresh
-        # delete lock
+    WAIT_TIME_SECONDS = 10
+    MAX_WAIT_TIME_MINUTES = 5
 
+    while need_refresh:
         lock_param_name = f"{ssm_param_path_prefix}/refresh_lock"
 
-        try:
-            ssm_client.put_parameter(
-                Name=lock_param_name,
-                Value="true",
-                Type="String",
-                Description="Refresh lock for CrowdStrike Distributor",
-                Overwrite=False,
-            )
-        except ssm_client.exceptions.ParameterAlreadyExists:
-            print(
-                "A refresh is already in progress. Waiting 30 seconds and trying again"
-            )
-            time.sleep(5)
-            refresh_presigned_urls = check_expired_presigned_url(
-                platform_filters, params_in_path, ssm_param_path_prefix
-            )
+        # check if lock exists
+        if params_in_path.get(lock_param_name):
+            # check if lock is old. A old lock means the refresh failed and we need to try again
+            if is_datetime_old(
+                params_in_path[lock_param_name]["LastModifiedDate"],
+                MAX_WAIT_TIME_MINUTES,
+            ):
+                try:
+                    print("Deleting lock it's older than 5 minutes")
+                    ssm_client.delete_parameter(Name=lock_param_name)
+                except ssm_client.exceptions.ParameterNotFound:
+                    pass
+        else:
+            # Create refresh lock
+            try:
+                ssm_client.put_parameter(
+                    Name=lock_param_name,
+                    Value="true",
+                    Type="String",
+                    Description="Refresh lock for CrowdStrike Distributor",
+                    Overwrite=False,
+                )
+                print("Created refresh lock")
+                refresh_presigned_urls()
+                need_refresh = False
+                continue
+            except ssm_client.exceptions.ParameterAlreadyExists:
+                pass
+
+        # Check if we still need to refresh
+        params_in_path = get_parameters_by_path(ssm_client, ssm_param_path_prefix)
+        need_refresh = check_expired_presigned_url(
+            platform_filters, params_in_path, ssm_param_path_prefix
+        )
+        print(
+            f"A refresh is already in progress. Waiting {WAIT_TIME_SECONDS} seconds and trying again"
+        )
+        time.sleep(WAIT_TIME_SECONDS)
 
     # # if ccid or install token is not present, create a new install token
     # if not falcon_ccid or not falcon_install_token or not falcon_bearer_token:
