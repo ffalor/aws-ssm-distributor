@@ -501,6 +501,11 @@ def script_handler(events, _):
                             Description=f"Presigned URLs for {os}",
                             Overwrite=True,
                         )
+                    
+                    # Delete refresh lock
+                    ssm_client.delete_parameter(Name=lock_param_name)
+                    print("Deleted refresh lock")
+                    
 
 
 
