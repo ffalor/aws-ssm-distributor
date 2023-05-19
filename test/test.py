@@ -74,7 +74,7 @@ class CrowdStrikeAPIError(Exception):
 class Falcon:
     """Crowdstrike Falcon API class"""
 
-    def __init__(self, cloud, client_id, client_secret, bearer_token):
+    def __init__(self, cloud, client_id, client_secret, bearer_token=None):
         self.cloud = cloud
         self.client_id = client_id
         self.client_secret = client_secret
@@ -351,7 +351,7 @@ def check_expired_presigned_url(platforms, params_in_path, ssm_param_path_prefix
     needs_refresh = False
 
     for filter_name, _ in platforms.items():
-        ssm_path = f"{ssm_param_path_prefix}/{filter_name}"
+        ssm_path = f"{ssm_param_path_prefix}/{filter_name}/presigned_urls"
 
         if not params_in_path.get(ssm_path):
             print(f"SSM parameter {ssm_path} not found")
@@ -365,9 +365,6 @@ def check_expired_presigned_url(platforms, params_in_path, ssm_param_path_prefix
 
     return needs_refresh
 
-
-def refresh_presigned_urls(platforms_filter):
-    pass
 
 def script_handler(events, _):
     """Handler for executeScript action
@@ -386,9 +383,10 @@ def script_handler(events, _):
     ssm_param_path_prefix = validate_prefix_path(events["ssm_param_path_prefix"])
     region = events["region"]
 
-    ssm_client = boto3.client("ssm", region_name=region)
-
     # Initialize variables
+    WAIT_TIME_SECONDS = 10
+    MAX_WAIT_TIME_MINUTES = 5
+    ssm_client = boto3.client("ssm", region_name=region)
     falcon_cloud = None
     falcon_client_id = None
     falcon_client_secret = None
@@ -398,31 +396,28 @@ def script_handler(events, _):
     ccid_param_name = f"{ssm_param_path_prefix}/CCID"
 
     # Get all values matching Prefix path
-    params_in_path = get_parameters_by_path(ssm_client, ssm_param_path_prefix)
+    params_in_path_prefix = get_parameters_by_path(ssm_client, ssm_param_path_prefix)
 
-    if params_in_path.get(ccid_param_name):
+    if params_in_path_prefix.get(ccid_param_name):
         print(f"Using CCID from {ccid_param_name}")
-        falcon_ccid = params_in_path[ccid_param_name]["Value"]
+        falcon_ccid = params_in_path_prefix[ccid_param_name]["Value"]
 
-    if params_in_path.get(install_token_param_name):
+    if params_in_path_prefix.get(install_token_param_name):
         print(f"Using install token from {install_token_param_name}")
-        falcon_install_token = params_in_path[install_token_param_name]["Value"]
+        falcon_install_token = params_in_path_prefix[install_token_param_name]["Value"]
 
     need_refresh = check_expired_presigned_url(
-        platform_filters, params_in_path, ssm_param_path_prefix
+        platform_filters, params_in_path_prefix, ssm_param_path_prefix
     )
-
-    WAIT_TIME_SECONDS = 10
-    MAX_WAIT_TIME_MINUTES = 5
 
     while need_refresh:
         lock_param_name = f"{ssm_param_path_prefix}/refresh_lock"
 
         # check if lock exists
-        if params_in_path.get(lock_param_name):
+        if params_in_path_prefix.get(lock_param_name):
             # check if lock is old. A old lock means the refresh failed and we need to try again
             if is_datetime_old(
-                params_in_path[lock_param_name]["LastModifiedDate"],
+                params_in_path_prefix[lock_param_name]["LastModifiedDate"],
                 MAX_WAIT_TIME_MINUTES,
             ):
                 try:
@@ -441,51 +436,91 @@ def script_handler(events, _):
                     Overwrite=False,
                 )
                 print("Created refresh lock")
-                refresh_presigned_urls()
-                need_refresh = False
+                # if ccid or install token is not present, create a new install token
+                if (
+                    not falcon_ccid
+                    or not falcon_install_token
+                ):
+                    falcon_cloud = (
+                        ssm_client.get_parameter(
+                            Name=falcon_cloud_param_name, WithDecryption=True
+                        )["Parameter"]["Value"]
+                        .replace("https://", "")
+                        .replace("http://", "")
+                    )
+
+                    falcon_client_id = ssm_client.get_parameter(
+                        Name=falcon_client_id_param_name, WithDecryption=True
+                    )["Parameter"]["Value"]
+
+                    falcon_client_secret = ssm_client.get_parameter(
+                        Name=falcon_client_secret_param_name, WithDecryption=True
+                    )["Parameter"]["Value"]
+
+                    falcon = Falcon(
+                        cloud=falcon_cloud,
+                        client_id=falcon_client_id,
+                        client_secret=falcon_client_secret
+                    )
+
+                    if not falcon_ccid:
+                        falcon_ccid = falcon.get_ccid()
+                        ssm_client.put_parameter(
+                            Name=ccid_param_name,
+                            Value=falcon_ccid,
+                            Type="String",
+                            Description="CrowdStrike Customer CID",
+                            Overwrite=True,
+                        )
+
+                    if not falcon_install_token:
+                        falcon_install_token = falcon.get_install_token()
+                        if falcon_install_token:
+                            ssm_client.put_parameter(
+                                Name=install_token_param_name,
+                                Value=falcon_install_token,
+                                Type="String",
+                                Description="CrowdStrike Install Token",
+                                Overwrite=True,
+                            )
+
+                    for os, os_versions in platform_filters.items():
+                        os_presigned_url_path = f"{ssm_param_path_prefix}/{platform}/presigned_urls"
+
+                        os_presigned_url_value = {}
+
+                        for version, filter in os_versions.items():
+                            os_presigned_url_value[version] = falcon.get_presigned_url(
+                                filter
+                            )
+
+                        ssm_client.put_parameter(
+                            Name=os_presigned_url_path,
+                            Value=json.dumps(os_presigned_url_value),
+                            Type="String",
+                            Description=f"Presigned URLs for {os}",
+                            Overwrite=True,
+                        )
+
+
+
+
+
                 continue
             except ssm_client.exceptions.ParameterAlreadyExists:
                 pass
 
         # Check if we still need to refresh
-        params_in_path = get_parameters_by_path(ssm_client, ssm_param_path_prefix)
+        params_in_path_prefix = get_parameters_by_path(
+            ssm_client, ssm_param_path_prefix
+        )
         need_refresh = check_expired_presigned_url(
-            platform_filters, params_in_path, ssm_param_path_prefix
+            platform_filters, params_in_path_prefix, ssm_param_path_prefix
         )
         print(
             f"A refresh is already in progress. Waiting {WAIT_TIME_SECONDS} seconds and trying again"
         )
         time.sleep(WAIT_TIME_SECONDS)
-
-    # # if ccid or install token is not present, create a new install token
-    # if not falcon_ccid or not falcon_install_token or not falcon_bearer_token:
-    #     falcon_cloud = (
-    #         get_ssm_param_value(ssm_client, falcon_cloud_param_name)
-    #         .replace("https://", "")
-    #         .replace("http://", "")
-    #     )
-    #     falcon_client_id = get_ssm_param_value(ssm_client, falcon_client_id_param_name)
-    #     falcon_client_secret = get_ssm_param_value(
-    #         ssm_client, falcon_client_secret_param_name
-    #     )
-    #     falcon = Falcon(
-    #         cloud=falcon_cloud,
-    #         client_id=falcon_client_id,
-    #         client_secret=falcon_client_secret,
-    #         bearer_token=falcon_bearer_token,
-    #     )
-
-    #     if not falcon_ccid:
-    #         falcon_ccid = falcon.get_ccid()
-    #         put_ssm_param_value(ssm_client, ccid_param_name, falcon_ccid)
-
-    #     if not falcon_install_token:
-    #         falcon_install_token = falcon.get_install_token()
-    #         put_ssm_param_value(ssm_client, install_token_param_name, falcon_install_token)
-
-    #     if not falcon_bearer_token:
-    #         falcon_bearer_token = falcon.bearer_token
-    #         put_ssm_param_value(ssm_client, bearer_token_param_name, falcon_bearer_token, param_type="SecureString")
 
     # response["falcon_cloud"] = falcon_cloud
     # response["falcon_bearer_token"] = falcon_bearer_token
