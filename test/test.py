@@ -1,15 +1,14 @@
 """Module test"""
 
 import http.client
-from lib2to3.pgen2.token import DOT
-from re import T
+import random
 import urllib.parse
 import time
 from datetime import datetime, timedelta
 import json
 from dateutil import tz
 import boto3
-from numpy import delete
+import botocore.exceptions
 
 # possible key paths
 # prefix/windows/presigned_urls
@@ -49,12 +48,29 @@ class CrowdStrikeAPIError(Exception):
 class Falcon:
     """Crowdstrike Falcon API class"""
 
-    def __init__(self, cloud, client_id, client_secret, bearer_token=None):
-        self.cloud = cloud
+    def __init__(
+        self, ssm_cloud_path, client_id, client_secret, ssm_helper, bearer_token=None
+    ):
+        """Default constructor
+
+        Args:
+            ssm_cloud_path (str): AWS SSM Parameter Store path for the Crowdstrike cloud
+            client_id (str): AWS SSM Parameter Store path for the Crowdstrike client_id
+            client_secret (str): AWS SSM Parameter Store path for the Crowdstrike client_secret
+            ssm_helper (SSMHelper): AWS SSM helper class
+            bearer_token (str, optional): CrowdStrike API OAUTH2 Token. Defaults to None.
+        """
+        self.ssm_cloud_path = ssm_cloud_path
         self.client_id = client_id
         self.client_secret = client_secret
         self.user_agent = "crowdstrike-official-distributor-package/v1.0.0"
+        self.cloud = None
         self.bearer_token = bearer_token
+        # Since we are using SSM to store client_id and client_secret
+        # we will use the SSM helper class to retrieve the values if
+        # a method is called that requires them.
+        # This reduces the logic needed in the script_handler
+        self.ssm_helper = ssm_helper
 
     def _oauth(self):
         """Creates OAuth bearer token
@@ -68,10 +84,19 @@ class Falcon:
         """
         print("Requesting Authentication token from Crowdstrike backend.")
 
+        falcon_cloud = (
+            self.ssm_helper.get_parameter(self.ssm_cloud_path)
+            .replace("https://", "")
+            .replace("http://", "")
+        )
+        self.cloud = falcon_cloud
+        falcon_client_id = self.ssm_helper.get_parameter(self.client_id)
+        falcon_client_secret = self.ssm_helper.get_parameter(self.client_secret)
+
         params = urllib.parse.urlencode(
             {
-                "client_id": self.client_id,
-                "client_secret": self.client_secret,
+                "client_id": falcon_client_id,
+                "client_secret": falcon_client_secret,
             }
         )
         headers = {
@@ -154,15 +179,22 @@ class Falcon:
         install_token_query_resp = conn.getresponse()
 
         if install_token_query_resp.status != 200:
-            raise CrowdStrikeAPIError(
-                f"Received non success response {install_token_query_resp.status} while fetching token. Error {install_token_query_resp.reason}"
-            )
+            if install_token_query_resp.status == 429:
+                sleep_time = 20
+                print(f"Too many requests, retrying in {sleep_time} seconds")
+                time.sleep(sleep_time)
+                return self.get_install_token()
+
+            else:
+                raise CrowdStrikeAPIError(
+                    f"Received non success response {install_token_query_resp.status} while fetching token. Error {install_token_query_resp.reason}"
+                )
 
         install_token_query_data = install_token_query_resp.read()
         resources = json.loads(install_token_query_data)["resources"]
         if len(resources) == 0:
             print("No Installation token found, skipping")
-            return None
+            return ""
 
         install_token_id = resources[0]
         url = f"/installation-tokens/entities/tokens/v1?ids={install_token_id}"
@@ -204,7 +236,7 @@ class Falcon:
         }
 
         encoded_url = urllib.parse.quote(
-            f"/sensors/combined/signed-urls/v1?limit=1&filter={api_filter}",
+            f"/sensors/combined/signed-urls/v1?offset=1&limit=1&filter={api_filter}",
             safe=":/?&=",
         )
         conn.request(
@@ -230,7 +262,7 @@ class Falcon:
             return None
 
         url = resources[0]["signed_url"]
-        print("Successfully received presigned URL")
+        print(f"Successfully received presigned URL for: {api_filter}")
         conn.close()
         return url
 
@@ -268,23 +300,44 @@ class SSMHelper:
         self.client = boto3.client("ssm", region_name=region)
         self.lock_path = lock_path
 
-    def put_parameter(self, Name, Value, Description, ParamType="String", Overwrite=True):
+    def put_parameter(
+        self,
+        name,
+        value,
+        description,
+        parem_type="String",
+        overwrite=True,
+        max_retries=5,
+    ):
         """Put a SSM parameter
 
         Args:
-            Name (str): Path to the SSM parameter
-            Value (str): Value of the SSM parameter
-            Description (str): Description of the SSM parameter
-            ParamType (str, optional): Type of the SSM parameter. Defaults to "String".
-            Overwrite (bool, optional): Whether to overwrite the SSM parameter. Defaults to True.
+            name (str): Path to the SSM parameter
+            value (str): Value of the SSM parameter
+            description (str): Description of the SSM parameter
+            param_type (str, optional): Type of the SSM parameter. Defaults to "String".
+            overwrite (bool, optional): Whether to overwrite the SSM parameter. Defaults to True.
         """
-        self.client.put_parameter(
-            Name=Name,
-            Value=Value,
-            Description=Description,
-            Type=ParamType, # type: ignore
-            Overwrite=Overwrite,
-        )
+
+        for retry in range(1, max_retries + 1):
+            try:
+                self.client.put_parameter(
+                    Name=name,
+                    Value=value,
+                    Description=description,
+                    Type=parem_type,  # type: ignore
+                    Overwrite=overwrite,
+                )
+                return
+            except self.client.exceptions.TooManyUpdates:
+                print(f"Too many updates, waiting {retry} seconds")
+                time.sleep(retry)
+            except botocore.exceptions.ClientError as error:
+                if error.response["Error"]["Code"] == "ThrottlingException":
+                    print(f"Throttling exception, waiting {retry} seconds")
+                    time.sleep(retry)
+                else:
+                    raise error
 
     def get_parameter(self, path):
         """Get a SSM parameter by path and return value.
@@ -293,12 +346,20 @@ class SSMHelper:
             path (str): Path to the SSM parameter
         """
 
-        response = self.client.get_parameter(
-            Name=path,
-            WithDecryption=True,
-        )
-
-        return response["Parameter"]["Value"]
+        try:
+            response = self.client.get_parameter(
+                Name=path,
+                WithDecryption=True,
+            )
+            return response["Parameter"]["Value"]
+        except botocore.exceptions.ClientError as error:
+            if error.response["Error"]["Code"] == "ThrottlingException":
+                wait_time = 5
+                print(f"Throttling exception, waiting {wait_time} seconds")
+                time.sleep(wait_time)
+                self.get_parameter(path)
+            else:
+                raise error
 
     def get_parameters_by_path(self, path):
         """Returns the parameters for the given path
@@ -314,15 +375,26 @@ class SSMHelper:
                 }
             }
         """
-        paginator = self.client.get_paginator("get_parameters_by_path")
+        try:
+            paginator = self.client.get_paginator("get_parameters_by_path")
 
-        response = {}
+            response = {}
 
-        for page in paginator.paginate(Path=path, WithDecryption=True, Recursive=True):
-            for parameter in page["Parameters"]:
-                response[parameter["Name"]] = parameter
+            for page in paginator.paginate(
+                Path=path, WithDecryption=True, Recursive=True
+            ):
+                for parameter in page["Parameters"]:
+                    response[parameter["Name"]] = parameter
 
-        return response
+            return response
+        except botocore.exceptions.ClientError as error:
+            if error.response["Error"]["Code"] == "ThrottlingException":
+                wait_time = 5
+                print(f"Throttling exception, waiting {wait_time} seconds")
+                time.sleep(wait_time)
+                self.get_parameter(path)
+            else:
+                raise error
 
     def create_refresh_lock(self, max_retries=5):
         """Creates the refresh lock parameter and retries if it fails
@@ -340,25 +412,22 @@ class SSMHelper:
         for retry in range(1, max_retries + 1):
             try:
                 self.put_parameter(
-                    Name=self.lock_path,
-                    Value="true",
-                    Description="Refresh lock for CrowdStrike Distributor",
-                    Overwrite=False,
+                    name=self.lock_path,
+                    value="true",
+                    description="Refresh lock for CrowdStrike Distributor",
+                    overwrite=False,
                 )
                 print(f"Successfully created refresh lock: {self.lock_path}")
                 return True
             except self.client.exceptions.ParameterAlreadyExists:
-                print(
-                    f"Refresh lock parameter {self.lock_path} already exists")
+                print(f"Refresh lock parameter {self.lock_path} already exists")
                 return False
             except Exception as err:  # pylint: disable=broad-except
-                print(
-                    f"Failed to create parameter {self.lock_path} with error {err}")
+                print(f"Failed to create parameter {self.lock_path} with error {err}")
                 print(f"Retry {retry}/{max_retries}")
                 time.sleep(5)
 
-        raise RuntimeError(
-            "Unable to create lock, exceeded maximum number of retries.")
+        raise RuntimeError("Unable to create lock, exceeded maximum number of retries.")
 
     def delete_refresh_lock(self, max_retries=5):
         """Deletes the refresh lock parameter and retries if it fails
@@ -371,13 +440,12 @@ class SSMHelper:
             try:
                 self.client.delete_parameter(Name=self.lock_path)
                 print(f"Successfully deleted refresh lock: {self.lock_path}")
-                return
+                return True
             except self.client.exceptions.ParameterNotFound:
                 print(f"Refresh lock parameter {self.lock_path} not found")
-                return
+                return False
             except Exception as err:
-                print(
-                    f"Failed to delete parameter {self.lock_path} with error {err}")
+                print(f"Failed to delete parameter {self.lock_path} with error {err}")
                 print(f"Retry {retry}/{max_retries}")
                 time.sleep(5)
         print("Unable to delete lock, exceeded maximum number of retries.")
@@ -448,8 +516,120 @@ def check_expired_presigned_url(platforms, params_in_path, ssm_param_path_prefix
     return needs_refresh
 
 
+def handle_params_refresh(falcon, ssm_helper, options):
+    """Handles the refresh of the ssm parameters and ensures required parameters are present
+
+
+    Args:
+        falcon (Falcon): Falcon class
+        ssm_helper (SSMHelper): SSMHelper class
+        options (dict): Options required to do the refresh
+    """
+
+    platforms = options["platforms"]
+    ssm_param_path_prefix = options["ssm_param_path_prefix"]
+    lock_param = options["lock_param"]
+    ccid_param = options["ccid_param"]
+    install_token_param = options["install_token_param"]
+    falcon_ccid = None
+    falcon_install_token = None
+
+    # Get all values matching Prefix path
+    params_in_path_prefix = ssm_helper.get_parameters_by_path(ssm_param_path_prefix)
+
+    if params_in_path_prefix.get(ccid_param):
+        print(f"Using CCID from {ccid_param}")
+        falcon_ccid = params_in_path_prefix[ccid_param]["Value"]
+
+    if params_in_path_prefix.get(install_token_param):
+        print(f"Using install token from {install_token_param}")
+        falcon_install_token = params_in_path_prefix[install_token_param]["Value"]
+
+    presigned_urls_expired = check_expired_presigned_url(
+        platforms, params_in_path_prefix, ssm_param_path_prefix
+    )
+
+    # Create a lock and refresh if:
+    # - a presigned url is missing
+    # - a presigned url is expired
+    # - falcon_ccid is missing
+    # - falcon_install_token is None
+    while presigned_urls_expired or falcon_install_token is None or falcon_ccid is None:
+        # Check if a refresh is already in progress
+        if params_in_path_prefix.get(lock_param):
+            # Check if lock is old. A old lock means the refresh failed and we need to try again
+            if is_datetime_old(
+                params_in_path_prefix[lock_param]["LastModifiedDate"],
+                MAX_WAIT_TIME_MINUTES,
+            ):
+                print(f"Deleting lock it's older than {MAX_WAIT_TIME_MINUTES} minutes")
+                deleted = ssm_helper.delete_refresh_lock()
+
+                if deleted:
+                    del params_in_path_prefix[lock_param]
+                    continue
+        else:
+            # Create refresh lock
+            if ssm_helper.create_refresh_lock():
+                print("We have the lock, updating all required ssm parameters")
+
+                # Update falcon_ccid if missing
+                if falcon_ccid is None:
+                    falcon_ccid = falcon.get_ccid()
+                    ssm_helper.put_parameter(
+                        ccid_param, falcon_ccid, "CrowdStrike Customer CID"
+                    )
+
+                # Update falcon_install_token if missing
+                if falcon_install_token is None:
+                    falcon_install_token = falcon.get_install_token()
+                    ssm_helper.put_parameter(
+                        install_token_param,
+                        falcon_install_token,
+                        "CrowdStrike Install Token",
+                    )
+
+                if presigned_urls_expired:
+                    for os_name, os_versions in platforms.items():
+                        os_presigned_url_path = (
+                            f"{ssm_param_path_prefix}/{os_name}/presigned_urls"
+                        )
+
+                        os_presigned_url_value = {}
+
+                        for version, api_filter in os_versions.items():
+                            os_presigned_url_value[version] = falcon.get_presigned_url(
+                                api_filter
+                            )
+
+                        print(
+                            f"Updating presigned URLs for {os_name} to {os_presigned_url_path}"
+                        )
+                        ssm_helper.put_parameter(
+                            name=os_presigned_url_path,
+                            value=json.dumps(os_presigned_url_value),
+                            description=f"Presigned URLs for {os_name}",
+                        )
+                        print(f"Succesfully updated {os_presigned_url_path}")
+
+                ssm_helper.delete_refresh_lock()
+                presigned_urls_expired = False
+                continue
+
+        # Sleep and then refresh state
+        print(
+            f"A refresh is already in progress. Waiting {WAIT_TIME_SECONDS} seconds and trying again"
+        )
+        time.sleep(WAIT_TIME_SECONDS)
+        params_in_path_prefix = ssm_helper.get_parameters_by_path(ssm_param_path_prefix)
+        falcon_install_token = params_in_path_prefix.get(install_token_param, None)
+        falcon_ccid = params_in_path_prefix.get(ccid_param, None)
+        presigned_urls_expired = check_expired_presigned_url(
+            platforms, params_in_path_prefix, ssm_param_path_prefix
+        )
+
+
 platform_filters = {
-    #TODO: Add debian
     "amzn_linux": {
         "1": "os:'Amazon Linux'+os_version:'1'",
         "2": "os:'Amazon Linux'+os_version:'2'",
@@ -490,137 +670,49 @@ def script_handler(events, _):
     Returns:
         dict: Output for the action
     """
+    # Many automation documents may be running at the same time.
+    # This whole solution is written in a way so that only one document
+    # at a time will be refreshing the presigned URLs.
+    # This is done by using a lock in SSM Parameter Store.
+    # Whichever document gets the lock will be the one to refresh the URLs.
+    # However, adding this sleep will help introduce some randomness
+    # in the execution of the documents.
+    # We don't want to sleep for a long time so instead we will use a
+    # floating point number between 1 and 5.
+    random_time = round(random.uniform(1, 5), 3)
+    print(f"Sleeping for {random_time} seconds")
+    time.sleep(random_time)
+
     response = compile_instance_list(events["instances"])
-    falcon_cloud_param_name = events["falcon_cloud"]
-    falcon_client_id_param_name = events["falcon_client_id"]
-    falcon_client_secret_param_name = events["falcon_client_secret"]
-    ssm_param_path_prefix = validate_prefix_path(
-        events["ssm_param_path_prefix"])
+    falcon_cloud_param = events["falcon_cloud"]
+    falcon_client_id_param = events["falcon_client_id"]
+    falcon_client_secret_param = events["falcon_client_secret"]
+    ssm_param_path_prefix = validate_prefix_path(events["ssm_param_path_prefix"])
     region = events["region"]
 
     # Initialize variables
-    lock_param_name = f"{ssm_param_path_prefix}/refresh_lock"
-    ssm_helper = SSMHelper(region=region, lock_path=lock_param_name)
-    falcon_cloud = None
-    falcon_client_id = None
-    falcon_client_secret = None
-    falcon_ccid = None
-    falcon_install_token = None
-    install_token_param_name = f"{ssm_param_path_prefix}/InstallToken"
-    ccid_param_name = f"{ssm_param_path_prefix}/CCID"
-
-    # Get all values matching Prefix path
-    params_in_path_prefix = ssm_helper.get_parameters_by_path(
-        ssm_param_path_prefix)
-
-    if params_in_path_prefix.get(ccid_param_name):
-        print(f"Using CCID from {ccid_param_name}")
-        falcon_ccid = params_in_path_prefix[ccid_param_name]["Value"]
-
-    if params_in_path_prefix.get(install_token_param_name):
-        print(f"Using install token from {install_token_param_name}")
-        falcon_install_token = params_in_path_prefix[install_token_param_name]["Value"]
-
-    need_refresh = check_expired_presigned_url(
-        platform_filters, params_in_path_prefix, ssm_param_path_prefix
+    lock_param = f"{ssm_param_path_prefix}/refresh_lock"
+    ssm_helper = SSMHelper(region=region, lock_path=lock_param)
+    install_token_param = f"{ssm_param_path_prefix}/InstallToken"
+    ccid_param = f"{ssm_param_path_prefix}/CCID"
+    falcon_client = Falcon(
+        falcon_cloud_param,
+        falcon_client_id_param,
+        falcon_client_secret_param,
+        ssm_helper,
     )
 
-    while need_refresh:
-        # check if a refresh is already in progress
-        if params_in_path_prefix.get(lock_param_name):
-            # check if lock is old. A old lock means the refresh failed and we need to try again
-            if is_datetime_old(
-                params_in_path_prefix[lock_param_name]["LastModifiedDate"],
-                MAX_WAIT_TIME_MINUTES,
-            ):
-                print(
-                    f"Deleting lock it's older than {MAX_WAIT_TIME_MINUTES} minutes")
-                ssm_helper.delete_refresh_lock()
-                del params_in_path_prefix[lock_param_name]
-                continue
-        else:
-            # Create refresh lock
-            if ssm_helper.create_refresh_lock():
-                print("We have the lock, updating all required ssm parameters")
-
-                falcon_cloud = (
-                    ssm_helper.get_parameter(falcon_cloud_param_name)
-                    .replace("https://", "")
-                    .replace("http://", "")
-                )
-
-                falcon_client_id = ssm_helper.get_parameter(
-                    falcon_client_id_param_name)
-
-                falcon_client_secret = ssm_helper.get_parameter(
-                    falcon_client_secret_param_name)
-
-                falcon = Falcon(
-                    cloud=falcon_cloud,
-                    client_id=falcon_client_id,
-                    client_secret=falcon_client_secret,
-                )
-
-                # Create CCID and Install Token if they don't exist
-                if not falcon_ccid or not falcon_install_token:
-                    if not falcon_ccid:
-                        falcon_ccid = falcon.get_ccid()
-
-                        ssm_helper.put_parameter(
-                            ccid_param_name,
-                            falcon_ccid,
-                            "CrowdStrike Customer CID"
-                        )
-
-                    if not falcon_install_token:
-                        falcon_install_token = falcon.get_install_token()
-                        if falcon_install_token:
-                            ssm_helper.put_parameter(
-                                install_token_param_name,
-                                falcon_install_token,
-                                "CrowdStrike Install Token"
-                            )
-
-                for os_name, os_versions in platform_filters.items():
-                    os_presigned_url_path = (
-                        f"{ssm_param_path_prefix}/{os_name}/presigned_urls"
-                    )
-
-                    os_presigned_url_value = {}
-
-                    for version, api_filter in os_versions.items():
-                        print(f"Getting presigned URL for {os_name} {version}")
-                        os_presigned_url_value[version] = falcon.get_presigned_url(
-                            api_filter
-                        )
-
-                    print(
-                        f"Saving presigned URLs for {os_name} to {os_presigned_url_path}"
-                    )
-                    ssm_helper.put_parameter(
-                        Name=os_presigned_url_path,
-                        Value=json.dumps(os_presigned_url_value),
-                        Description=f"Presigned URLs for {os_name}"
-                    )
-
-                ssm_helper.delete_refresh_lock()
-                need_refresh = False
-                continue
-
-        # Check if we still need to refresh
-        params_in_path_prefix = ssm_helper.get_parameters_by_path(
-            ssm_param_path_prefix)
-        need_refresh = check_expired_presigned_url(
-            platform_filters, params_in_path_prefix, ssm_param_path_prefix
-        )
-        print(
-            f"A refresh is already in progress. Waiting {WAIT_TIME_SECONDS} seconds and trying again"
-        )
-        time.sleep(WAIT_TIME_SECONDS)
-
-    response["falcon_cloud"] = falcon_cloud
-    response["falcon_ccid"] = falcon_ccid
-    response["falcon_install_token"] = falcon_install_token
+    handle_params_refresh(
+        falcon_client,
+        ssm_helper,
+        {
+            "install_token_param": install_token_param,
+            "ccid_param": ccid_param,
+            "lock_param": lock_param,
+            "platforms": platform_filters,
+            "ssm_param_path_prefix": ssm_param_path_prefix,
+        },
+    )
 
     return response
 
