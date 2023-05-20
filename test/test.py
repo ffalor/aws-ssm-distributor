@@ -10,37 +10,6 @@ from dateutil import tz
 import boto3
 import botocore.exceptions
 
-# possible key paths
-# prefix/windows/presigned_urls
-# prefix/debian/presigned_urls
-# prefix/amzn_linux/presigned_urls
-# {
-#     "1": "value",
-#     "2": "value",
-#     "2-arm64": "value",
-# }
-# prefix/sles/presigned_urls
-# {
-#     "11": "value",
-#     "12": "value",
-#     "15": "value"
-# }
-# prefix/ubuntu/presigned_urls
-# {
-#     "16/18/20/22": "value",
-#     "18/20/22-arm64": "value",
-# }
-# prefix/rhel/presigned_urls
-# {
-#     "6": "value",
-#     "7": "value",
-#     "8": "value",
-#     "8-arm64": "value",
-#     "9": "value",
-#     "9-arm64": "value",
-# }
-
-
 class CrowdStrikeAPIError(Exception):
     """Crowdstrike API error"""
 
@@ -91,7 +60,8 @@ class Falcon:
         )
         self.cloud = falcon_cloud
         falcon_client_id = self.ssm_helper.get_parameter(self.client_id)
-        falcon_client_secret = self.ssm_helper.get_parameter(self.client_secret)
+        falcon_client_secret = self.ssm_helper.get_parameter(
+            self.client_secret)
 
         params = urllib.parse.urlencode(
             {
@@ -420,14 +390,17 @@ class SSMHelper:
                 print(f"Successfully created refresh lock: {self.lock_path}")
                 return True
             except self.client.exceptions.ParameterAlreadyExists:
-                print(f"Refresh lock parameter {self.lock_path} already exists")
+                print(
+                    f"Refresh lock parameter {self.lock_path} already exists")
                 return False
             except Exception as err:  # pylint: disable=broad-except
-                print(f"Failed to create parameter {self.lock_path} with error {err}")
+                print(
+                    f"Failed to create parameter {self.lock_path} with error {err}")
                 print(f"Retry {retry}/{max_retries}")
                 time.sleep(5)
 
-        raise RuntimeError("Unable to create lock, exceeded maximum number of retries.")
+        raise RuntimeError(
+            "Unable to create lock, exceeded maximum number of retries.")
 
     def delete_refresh_lock(self, max_retries=5):
         """Deletes the refresh lock parameter and retries if it fails
@@ -445,7 +418,8 @@ class SSMHelper:
                 print(f"Refresh lock parameter {self.lock_path} not found")
                 return False
             except Exception as err:
-                print(f"Failed to delete parameter {self.lock_path} with error {err}")
+                print(
+                    f"Failed to delete parameter {self.lock_path} with error {err}")
                 print(f"Retry {retry}/{max_retries}")
                 time.sleep(5)
         print("Unable to delete lock, exceeded maximum number of retries.")
@@ -535,7 +509,8 @@ def handle_params_refresh(falcon, ssm_helper, options):
     falcon_install_token = None
 
     # Get all values matching Prefix path
-    params_in_path_prefix = ssm_helper.get_parameters_by_path(ssm_param_path_prefix)
+    params_in_path_prefix = ssm_helper.get_parameters_by_path(
+        ssm_param_path_prefix)
 
     if params_in_path_prefix.get(ccid_param):
         print(f"Using CCID from {ccid_param}")
@@ -562,7 +537,8 @@ def handle_params_refresh(falcon, ssm_helper, options):
                 params_in_path_prefix[lock_param]["LastModifiedDate"],
                 MAX_WAIT_TIME_MINUTES,
             ):
-                print(f"Deleting lock it's older than {MAX_WAIT_TIME_MINUTES} minutes")
+                print(
+                    f"Deleting lock it's older than {MAX_WAIT_TIME_MINUTES} minutes")
                 deleted = ssm_helper.delete_refresh_lock()
 
                 if deleted:
@@ -621,8 +597,10 @@ def handle_params_refresh(falcon, ssm_helper, options):
             f"A refresh is already in progress. Waiting {WAIT_TIME_SECONDS} seconds and trying again"
         )
         time.sleep(WAIT_TIME_SECONDS)
-        params_in_path_prefix = ssm_helper.get_parameters_by_path(ssm_param_path_prefix)
-        falcon_install_token = params_in_path_prefix.get(install_token_param, None)
+        params_in_path_prefix = ssm_helper.get_parameters_by_path(
+            ssm_param_path_prefix)
+        falcon_install_token = params_in_path_prefix.get(
+            install_token_param, None)
         falcon_ccid = params_in_path_prefix.get(ccid_param, None)
         presigned_urls_expired = check_expired_presigned_url(
             platforms, params_in_path_prefix, ssm_param_path_prefix
@@ -683,11 +661,17 @@ def script_handler(events, _):
     print(f"Sleeping for {random_time} seconds")
     time.sleep(random_time)
 
-    response = compile_instance_list(events["instances"])
+    instances = events["instances"]
+    if len(instances) == 0:
+        print("No instances passed to the action")
+        return
+
+    response = compile_instance_list(instances)
     falcon_cloud_param = events["falcon_cloud"]
     falcon_client_id_param = events["falcon_client_id"]
     falcon_client_secret_param = events["falcon_client_secret"]
-    ssm_param_path_prefix = validate_prefix_path(events["ssm_param_path_prefix"])
+    ssm_param_path_prefix = validate_prefix_path(
+        events["ssm_param_path_prefix"])
     region = events["region"]
 
     # Initialize variables
@@ -717,22 +701,22 @@ def script_handler(events, _):
     return response
 
 
-events1 = {
-    "falcon_cloud": "/CrowdStrike/Falcon/Cloud",
-    "falcon_client_id": "/CrowdStrike/Falcon/ClientId",
-    "falcon_client_secret": "/CrowdStrike/Falcon/ClientSecret",
-    "ssm_param_path_prefix": "/CrowdStrike/Falcon",
-    "region": "us-east-1",
-    "instances": [
-        {
-            "InstanceId": "i-0c9b5b2b7b5b2b7b5",
-            "PlatformType": "Windows",
-        },
-        {
-            "InstanceId": "i-0c9b5b2b7b5b2b7b5",
-            "PlatformType": "Linux",
-        },
-    ],
-}
+# events1 = {
+#     "falcon_cloud": "/CrowdStrike/Falcon/Cloud",
+#     "falcon_client_id": "/CrowdStrike/Falcon/ClientId",
+#     "falcon_client_secret": "/CrowdStrike/Falcon/ClientSecret",
+#     "ssm_param_path_prefix": "/CrowdStrike/Falcon",
+#     "region": "us-east-1",
+#     "instances": [
+#         {
+#             "InstanceId": "i-0c9b5b2b7b5b2b7b5",
+#             "PlatformType": "Windows",
+#         },
+#         {
+#             "InstanceId": "i-0c9b5b2b7b5b2b7b5",
+#             "PlatformType": "Linux",
+#         },
+#     ],
+# }
 
-print(script_handler(events1, None))
+# print(script_handler(events1, None))
