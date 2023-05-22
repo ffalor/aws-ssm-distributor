@@ -10,7 +10,6 @@ from dateutil import tz
 import boto3
 import botocore.exceptions
 
-
 class CrowdStrikeAPIError(Exception):
     """Crowdstrike API error"""
 
@@ -569,7 +568,7 @@ def handle_params_refresh(falcon, ssm_helper, options):
                 if presigned_urls_expired:
                     for os_name, os_versions in platforms.items():
                         os_presigned_url_path = (
-                            f"{ssm_param_path_prefix}/{os_name}/presigned_urls"
+                            f"{ssm_param_path_prefix}/{os_name}/{PRESIGNED_SUFFIX}"
                         )
 
                         os_presigned_url_value = {}
@@ -637,6 +636,7 @@ platform_filters = {
 
 WAIT_TIME_SECONDS = 5
 MAX_WAIT_TIME_MINUTES = 1
+PRESIGNED_SUFFIX = "presigned_urls"
 
 
 def script_handler(events, _):
@@ -659,15 +659,14 @@ def script_handler(events, _):
     # We don't want to sleep for a long time so instead we will use a
     # floating point number between 1 and 5.
     random_time = round(random.uniform(1, 5), 3)
-    print(f"Sleeping for {random_time} seconds")
     time.sleep(random_time)
 
     instances = events["instances"]
+    response = compile_instance_list(instances)
     if len(instances) == 0:
         print("No instances passed to the action")
-        return
+        return response
 
-    response = compile_instance_list(instances)
     falcon_cloud_param = events["falcon_cloud"]
     falcon_client_id_param = events["falcon_client_id"]
     falcon_client_secret_param = events["falcon_client_secret"]
@@ -699,6 +698,16 @@ def script_handler(events, _):
         },
     )
 
+    # Add the presigned URLs to the response
+    for os_name, _ in platform_filters.items():
+        os_presigned_url_path = (
+            f"{ssm_param_path_prefix}/{os_name}/{PRESIGNED_SUFFIX}"
+        )
+
+        response[f"{os_name}_urls"] = os_presigned_url_path
+
+    response["falcon_ccid"] = ccid_param
+    response["falcon_install_token"] = install_token_param
     return response
 
 

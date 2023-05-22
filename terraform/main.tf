@@ -15,6 +15,7 @@ locals {
   region        = var.region
   instance_name = "SSMTerraformTestInstance"
   ip            = jsondecode(data.http.ip.response_body)["ip"]
+  ssm_group_name = "ssm_demo"
 }
 
 module "vpc" {
@@ -100,6 +101,26 @@ module "ec2_instance" {
   }
 }
 
+resource "aws_resourcegroups_group" "test" {
+  name = local.ssm_group_name
+
+  resource_query {
+    query = <<JSON
+{
+  "ResourceTypeFilters": [
+    "AWS::EC2::Instance"
+  ],
+  "TagFilters": [
+    {
+      "Key": "Name",
+      "Values": ["${local.instance_name}"]
+    }
+  ]
+}
+JSON
+  }
+}
+
 resource "aws_ssm_document" "sensor_deploy" {
   name = "CrowdStrike-FalconSensorDeployV2"
 
@@ -117,8 +138,8 @@ resource "aws_ssm_association" "sensor_deploy" {
   name = aws_ssm_document.sensor_deploy.name
 
   targets {
-    key = "InstanceIds"
-    values = ["*"]
+    key = "ResourceGroup"
+    values = [local.ssm_group_name]
   }
 
   automation_target_parameter_name = "InstanceIds"
@@ -126,4 +147,6 @@ resource "aws_ssm_association" "sensor_deploy" {
   parameters = {
     AutomationAssumeRole = data.aws_iam_role.ssm_assume_role.arn
   }
+
+  depends_on = [aws_resourcegroups_group.test]
 }
